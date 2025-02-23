@@ -118,6 +118,7 @@ use core::fmt::{self, Formatter};
 use rand_core::RngCore;
 
 use super::utils::shuffle_slice;
+
 /// Default coin selection algorithm used by [`TxBuilder`](super::tx_builder::TxBuilder) if not
 /// overridden
 pub type DefaultCoinSelectionAlgorithm = BranchAndBoundCoinSelection<SingleRandomDraw>;
@@ -222,6 +223,7 @@ pub trait CoinSelectionAlgorithm: core::fmt::Debug {
         target_amount: Amount,
         drain_script: &Script,
         rand: &mut R,
+        avoid_partial_spends: bool,
     ) -> Result<CoinSelectionResult, InsufficientFunds>;
 }
 
@@ -241,11 +243,49 @@ impl CoinSelectionAlgorithm for LargestFirstCoinSelection {
         target_amount: Amount,
         drain_script: &Script,
         _: &mut R,
+        avoid_partial_spends: bool,
     ) -> Result<CoinSelectionResult, InsufficientFunds> {
+        if avoid_partial_spends {
+            // Group outputs by destination address
+            let mut grouped_utxos = Vec::new();
+            let mut current_group = Vec::new();
+            let mut current_address = None;
+
+            for utxo in optional_utxos.iter() {
+                let address = utxo.utxo.txout().script_pubkey.clone();
+                if current_address.is_none() {
+                    current_address = Some(address.clone());
+                }
+
+                if current_address == Some(address.clone()) {
+                    current_group.push(utxo.clone());
+                } else {
+                    grouped_utxos.push(current_group.clone());
+                    current_group.clear();
+                    current_group.push(utxo.clone());
+                    current_address = Some(address.clone());
+                }
+            }
+
+            if !current_group.is_empty() {
+                grouped_utxos.push(current_group);
+            }
+
+            // Sort groups by total value
+            grouped_utxos.sort_by_key(|group| {
+                group.iter().map(|utxo| utxo.utxo.txout().value).sum::<Amount>()
+            });
+
+            // Flatten the grouped UTXOs
+            optional_utxos = grouped_utxos.into_iter().flatten().collect();
+        } else {
+            // Sort UTXOs by value
+            optional_utxos.sort_unstable_by_key(|wu| wu.utxo.txout().value);
+        }
+
         // We put the "required UTXOs" first and make sure the optional UTXOs are sorted,
         // initially smallest to largest, before being reversed with `.rev()`.
         let utxos = {
-            optional_utxos.sort_unstable_by_key(|wu| wu.utxo.txout().value);
             required_utxos
                 .into_iter()
                 .map(|utxo| (true, utxo))
@@ -272,16 +312,53 @@ impl CoinSelectionAlgorithm for OldestFirstCoinSelection {
         target_amount: Amount,
         drain_script: &Script,
         _: &mut R,
+        avoid_partial_spends: bool,
     ) -> Result<CoinSelectionResult, InsufficientFunds> {
-        // We put the "required UTXOs" first and make sure the optional UTXOs are sorted from
-        // oldest to newest according to blocktime
-        // For utxo that doesn't exist in DB, they will have lowest priority to be selected
-        let utxos = {
+        if avoid_partial_spends {
+            // Group outputs by destination address
+            let mut grouped_utxos = Vec::new();
+            let mut current_group = Vec::new();
+            let mut current_address = None;
+
+            for utxo in optional_utxos.iter() {
+                let address = utxo.utxo.txout().script_pubkey.clone();
+                if current_address.is_none() {
+                    current_address = Some(address.clone());
+                }
+
+                if current_address == Some(address.clone()) {
+                    current_group.push(utxo.clone());
+                } else {
+                    grouped_utxos.push(current_group.clone());
+                    current_group.clear();
+                    current_group.push(utxo.clone());
+                    current_address = Some(address.clone());
+                }
+            }
+
+            if !current_group.is_empty() {
+                grouped_utxos.push(current_group);
+            }
+
+            // Sort groups by total value
+            grouped_utxos.sort_by_key(|group| {
+                group.iter().map(|utxo| utxo.utxo.txout().value).sum::<Amount>()
+            });
+
+            // Flatten the grouped UTXOs
+            optional_utxos = grouped_utxos.into_iter().flatten().collect();
+        } else {
+            // Sort UTXOs by blockheight
             optional_utxos.sort_unstable_by_key(|wu| match &wu.utxo {
                 Utxo::Local(local) => Some(local.chain_position),
                 Utxo::Foreign { .. } => None,
             });
+        }
 
+        // We put the "required UTXOs" first and make sure the optional UTXOs are sorted from
+        // oldest to newest according to blocktime
+        // For utxo that doesn't exist in DB, they will have lowest priority to be selected
+        let utxos = {
             required_utxos
                 .into_iter()
                 .map(|utxo| (true, utxo))
@@ -448,6 +525,7 @@ impl<Cs: CoinSelectionAlgorithm> CoinSelectionAlgorithm for BranchAndBoundCoinSe
         target_amount: Amount,
         drain_script: &Script,
         rand: &mut R,
+        avoid_partial_spends: bool,
     ) -> Result<CoinSelectionResult, InsufficientFunds> {
         // Mapping every (UTXO, usize) to an output group
         let required_ogs: Vec<OutputGroup> = required_utxos
@@ -545,6 +623,7 @@ impl<Cs: CoinSelectionAlgorithm> CoinSelectionAlgorithm for BranchAndBoundCoinSe
                 target_amount,
                 drain_script,
                 rand,
+                avoid_partial_spends,
             ),
         }
     }
@@ -685,11 +764,43 @@ impl CoinSelectionAlgorithm for SingleRandomDraw {
         target_amount: Amount,
         drain_script: &Script,
         rand: &mut R,
+        avoid_partial_spends: bool,
     ) -> Result<CoinSelectionResult, InsufficientFunds> {
+        if avoid_partial_spends {
+            // Group outputs by destination address
+            let mut grouped_utxos = Vec::new();
+            let mut current_group = Vec::new();
+            let mut current_address = None;
+
+            for utxo in optional_utxos.iter() {
+                let address = utxo.utxo.txout().script_pubkey.clone();
+                if current_address.is_none() {
+                    current_address = Some(address.clone());
+                }
+
+                if current_address == Some(address.clone()) {
+                    current_group.push(utxo.clone());
+                } else {
+                    grouped_utxos.push(current_group.clone());
+                    current_group.clear();
+                    current_group.push(utxo.clone());
+                    current_address = Some(address.clone());
+                }
+            }
+
+            if !current_group.is_empty() {
+                grouped_utxos.push(current_group);
+            }
+
+            // Flatten the grouped UTXOs
+            optional_utxos = grouped_utxos.into_iter().flatten().collect();
+        } else {
+            // Shuffle UTXOs
+            shuffle_slice(&mut optional_utxos, rand);
+        }
+
         // We put the required UTXOs first and then the randomize optional UTXOs to take as needed
         let utxos = {
-            shuffle_slice(&mut optional_utxos, rand);
-
             required_utxos
                 .into_iter()
                 .map(|utxo| (true, utxo))
@@ -931,6 +1042,7 @@ mod test {
                 target_amount,
                 &drain_script,
                 &mut thread_rng(),
+                false,
             )
             .unwrap();
 
@@ -953,6 +1065,7 @@ mod test {
                 target_amount,
                 &drain_script,
                 &mut thread_rng(),
+                false,
             )
             .unwrap();
 
@@ -975,6 +1088,7 @@ mod test {
                 target_amount,
                 &drain_script,
                 &mut thread_rng(),
+                false,
             )
             .unwrap();
 
@@ -996,6 +1110,7 @@ mod test {
             target_amount,
             &drain_script,
             &mut thread_rng(),
+            false,
         );
         assert!(matches!(result, Err(InsufficientFunds { .. })));
     }
@@ -1013,6 +1128,7 @@ mod test {
             target_amount,
             &drain_script,
             &mut thread_rng(),
+            false,
         );
         assert!(matches!(result, Err(InsufficientFunds { .. })));
     }
@@ -1031,6 +1147,7 @@ mod test {
                 target_amount,
                 &drain_script,
                 &mut thread_rng(),
+                false,
             )
             .unwrap();
 
@@ -1053,6 +1170,7 @@ mod test {
                 target_amount,
                 &drain_script,
                 &mut thread_rng(),
+                false,
             )
             .unwrap();
 
@@ -1075,6 +1193,7 @@ mod test {
                 target_amount,
                 &drain_script,
                 &mut thread_rng(),
+                false,
             )
             .unwrap();
 
@@ -1096,6 +1215,7 @@ mod test {
             target_amount,
             &drain_script,
             &mut thread_rng(),
+            false,
         );
         assert!(matches!(result, Err(InsufficientFunds { .. })));
     }
@@ -1115,6 +1235,7 @@ mod test {
             target_amount,
             &drain_script,
             &mut thread_rng(),
+            false,
         );
         assert!(matches!(result, Err(InsufficientFunds { .. })));
     }
@@ -1135,6 +1256,7 @@ mod test {
                 target_amount,
                 &drain_script,
                 &mut thread_rng(),
+                false,
             )
             .unwrap();
 
@@ -1157,6 +1279,7 @@ mod test {
                 target_amount,
                 &drain_script,
                 &mut thread_rng(),
+                false,
             )
             .unwrap();
 
@@ -1181,6 +1304,7 @@ mod test {
                 target_amount,
                 &drain_script,
                 &mut thread_rng(),
+                false,
             )
             .unwrap();
 
@@ -1205,6 +1329,7 @@ mod test {
             target_amount,
             &drain_script,
             &mut thread_rng(),
+            false,
         );
 
         assert!(
@@ -1233,6 +1358,7 @@ mod test {
             target_amount,
             &drain_script,
             &mut rng,
+            false,
         );
 
         assert!(matches!(result, Err(InsufficientFunds {needed, available})
@@ -1276,6 +1402,7 @@ mod test {
                 target_amount,
                 &drain_script,
                 &mut thread_rng(),
+                false,
             )
             .unwrap();
 
@@ -1297,6 +1424,7 @@ mod test {
             target_amount,
             &drain_script,
             &mut thread_rng(),
+            false,
         );
 
         assert!(matches!(result, Err(InsufficientFunds { .. })));
@@ -1315,6 +1443,7 @@ mod test {
             target_amount,
             &drain_script,
             &mut thread_rng(),
+            false,
         );
         assert!(matches!(result, Err(InsufficientFunds { .. })));
     }
@@ -1335,6 +1464,7 @@ mod test {
                 target_amount,
                 &drain_script,
                 &mut thread_rng(),
+                false,
             )
             .unwrap();
 
@@ -1364,6 +1494,7 @@ mod test {
                     target_amount,
                     &drain_script,
                     &mut thread_rng(),
+                    false,
                 )
                 .unwrap();
             assert_eq!(result.selected_amount(), target_amount);
@@ -1533,6 +1664,7 @@ mod test {
             Amount::from_sat(500_000),
             &drain_script,
             &mut thread_rng(),
+            false,
         );
 
         assert_matches!(
@@ -1560,6 +1692,7 @@ mod test {
             Amount::from_sat(500_000),
             &drain_script,
             &mut thread_rng(),
+            false,
         );
 
         assert_matches!(
@@ -1583,6 +1716,7 @@ mod test {
             Amount::from_sat(500_000),
             &drain_script,
             &mut thread_rng(),
+            false,
         );
 
         assert_matches!(
@@ -1613,6 +1747,7 @@ mod test {
                 target_amount,
                 &drain_script,
                 &mut thread_rng(),
+                false,
             )
             .unwrap();
         assert_eq!(res.selected_amount(), Amount::from_sat(200_000));
@@ -1766,6 +1901,7 @@ mod test {
                         target_amount,
                         &drain_script,
                         &mut thread_rng(),
+                        false,
                     )
                 }
                 CoinSelectionAlgo::OldestFirst => OldestFirstCoinSelection.coin_select(
@@ -1775,6 +1911,7 @@ mod test {
                     target_amount,
                     &drain_script,
                     &mut thread_rng(),
+                    false,
                 ),
                 CoinSelectionAlgo::LargestFirst => LargestFirstCoinSelection.coin_select(
                     vec![],
@@ -1783,6 +1920,7 @@ mod test {
                     target_amount,
                     &drain_script,
                     &mut thread_rng(),
+                    false,
                 ),
             };
 
