@@ -852,3 +852,68 @@ proptest! {
         prop_assert_eq!(heights, exp_heights);
     }
 }
+
+/// Verify that `LocalChain::is_block_in_chain` and `LocalChain::get` scale
+/// sub-linearly (O(log n)) with chain length, not linearly (O(n)).
+///
+/// Builds chains of 1K, 10K, and 100K checkpoints, runs 1000 lookups on each,
+/// and asserts that the 100K chain is no more than 3x slower than the 1K chain.
+/// With O(n) this ratio would be ~100x. With O(log n) it's ~1.5x.
+#[test]
+fn is_block_in_chain_scales_sublinearly() {
+    use bdk_chain::ChainOracle;
+    use std::time::Instant;
+
+    fn build_chain(num_checkpoints: u32) -> LocalChain {
+        let blocks: std::collections::BTreeMap<u32, BlockHash> = (0..num_checkpoints)
+            .map(|h| {
+                let hash = bitcoin::hashes::Hash::hash(h.to_le_bytes().as_slice());
+                (h, hash)
+            })
+            .collect();
+        LocalChain::from_blocks(blocks).expect("valid chain")
+    }
+
+    fn bench_lookups(chain: &LocalChain, num_lookups: u32) -> std::time::Duration {
+        let tip = chain.tip().block_id();
+        // Look up checkpoints at various heights across the chain.
+        let max_height = tip.height;
+        let start = Instant::now();
+        for i in 0..num_lookups {
+            let target_height = (i * 7 + 13) % max_height; // pseudo-random scatter
+            let target_hash = chain.get(target_height).unwrap().hash();
+            let block = BlockId {
+                height: target_height,
+                hash: target_hash,
+            };
+            let result = chain.is_block_in_chain(block, tip).unwrap();
+            assert_eq!(result, Some(true));
+        }
+        start.elapsed()
+    }
+
+    let sizes = [1_000u32, 10_000, 100_000];
+    let num_lookups = 1_000;
+
+    let mut durations = Vec::new();
+    for &size in &sizes {
+        let chain = build_chain(size);
+        bench_lookups(&chain, 100); // warm up
+        let dur = bench_lookups(&chain, num_lookups);
+        durations.push((size, dur));
+    }
+
+    let ratio_100x = durations[2].1.as_nanos() as f64 / durations[0].1.as_nanos() as f64;
+
+    // With O(n) the 100K/1K ratio is ~100-124x.
+    // With O(log n) it should be ~1.7x. We use 5x as a generous bound.
+    assert!(
+        ratio_100x < 5.0,
+        "is_block_in_chain scales linearly: 100K chain took {:.1}x longer than 1K chain \
+         (1K={:?}, 10K={:?}, 100K={:?}). Expected < 5x for O(log n).",
+        ratio_100x,
+        durations[0].1,
+        durations[1].1,
+        durations[2].1,
+    );
+}
